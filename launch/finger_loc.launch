@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<launch>
+
+    <node pkg="tf2_ros" type="static_transform_publisher" name="ur5_word_tf" args="0 0 0.0762 0 0 0 1 map world" />
+
+    <include file="$(find ur_robot_driver)/launch/ur5e_bringup.launch">
+        <arg name="robot_ip" value="192.168.0.101"/>
+        <arg name="kinematics_config" value="$(find finger_loc_ros)/calib/ur5e_calib.yaml"/>
+    </include>
+
+</launch>
