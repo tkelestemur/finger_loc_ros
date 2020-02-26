@@ -247,6 +247,7 @@ class FingerLocROS(object):
         #downsample -- other interpolation options
         # interpolation = cv2.INTER_NEAREST, cv2.INTER_LANCZOS4
         im_ar_down = cv2.resize(im_ar_cropped,(64,64), interpolation = cv2.INTER_AREA)
+        print(im_ar_down)
         #to see realistic view you can upsample it again to get the pixelated
         #image cv2.resize(cv2.resize(im_ar_cropped,(64,64), interpolation = cv2.INTER_AREA),(480,480),interpolation = cv2.INTER_NEAREST)*255
         return im_ar_down
@@ -256,28 +257,28 @@ def main():
     finger_loc = FingerLocROS()
 
     #test depth image (works)
-    # image = finger_loc.get_depth_image()
-    # im = cv2.resize(image,(480,480),interpolation = cv2.INTER_NEAREST)*255
-    # fig = plt.figure()
-    # ax = fig.add_subplot(1,1,1)
-    # ax.imshow(im, cmap='gray', vmin=0,vmax=255)
-    # plt.show()
-
-    finger_loc.go_to_home()
-    finger_loc.go_to_start()
-    obs = finger_loc.control(total_time=16, eef_vel=eef_vel)
-    finger_loc.go_to_home()
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    axes[0].plot(obs['finger_pos'][:, 0])
-    axes[0].plot(obs['finger_pos'][:, 1])
-
-    axes[1].plot(obs['filter_pos'][:, 0])
-    axes[1].plot(obs['filter_pos'][:, 1])
-
-    axes[2].plot(obs['finger_vel'][:, 0])
-    axes[2].plot(obs['finger_vel'][:, 1])
+    image = finger_loc.get_depth_image()
+    im = cv2.resize(image,(480,480),interpolation = cv2.INTER_NEAREST)*255
+    fig = plt.figure()
+    ax = fig.add_subplot(1,1,1)
+    ax.imshow(im, cmap='gray', vmin=0,vmax=255)
     plt.show()
+
+    # finger_loc.go_to_home()
+    # finger_loc.go_to_start()
+    # obs = finger_loc.control(total_time=16, eef_vel=eef_vel)
+    # finger_loc.go_to_home()
+
+    # fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    # axes[0].plot(obs['finger_pos'][:, 0])
+    # axes[0].plot(obs['finger_pos'][:, 1])
+
+    # axes[1].plot(obs['filter_pos'][:, 0])
+    # axes[1].plot(obs['filter_pos'][:, 1])
+
+    # axes[2].plot(obs['finger_vel'][:, 0])
+    # axes[2].plot(obs['finger_vel'][:, 1])
+    # plt.show()
 
 
 if __name__ == '__main__':
