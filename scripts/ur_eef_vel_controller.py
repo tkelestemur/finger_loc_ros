@@ -14,6 +14,11 @@ from control_msgs.msg import FollowJointTrajectoryGoal, FollowJointTrajectoryAct
 import numpy as np
 import matplotlib.pyplot as plt
 
+'''Added to support "get_depth_image()" '''
+import cv2 #used to downsample and convert depth image to array
+from cv_bridge import CvBridge, CvBridgeError
+from sensor_msgs.msg import Image
+
 class FingerLocROS(object):
     def __init__(self):
 
@@ -25,7 +30,7 @@ class FingerLocROS(object):
         self.vel_ik_solver = kdl.ChainIkSolverVel_pinv(self.chain)
         self.pos_fk_solver = kdl.ChainFkSolverPos_recursive(self.chain)
         self.pos_ik_solver = kdl.ChainIkSolverPos_LMA(self.chain)
-        
+
         self.joint_state = kdl.JntArrayVel(self.num_joints)
         self.joint_names = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
 
@@ -35,16 +40,18 @@ class FingerLocROS(object):
         self.joint_vel_cmd_pub = rospy.Publisher('/joint_group_vel_controller/command', Float64MultiArray, queue_size=10)
         self.joint_pos_cmd_pub = rospy.Publisher('/scaled_pos_traj_controller/command', JointTrajectory, queue_size=10)
         self.speed_scaling_pub = rospy.Publisher('/speed_scaling_factor', Float64, queue_size=10)
-        
-        
+
+
         self.switch_controller_cli = rospy.ServiceProxy('/controller_manager/switch_controller', SwitchController)
         self.joint_pos_cli = actionlib.SimpleActionClient('/scaled_pos_traj_controller/follow_joint_trajectory', FollowJointTrajectoryAction)
+
+        self.bridge = CvBridge() #allows conversion from depth image to array
         rospy.sleep(0.5)
 
     def switch_controller(self, mode=None):
         req = SwitchControllerRequest()
         res = SwitchControllerResponse()
-        
+
         req.start_asap = False
         req.timeout = 0.0
         if mode == 'velocity':
@@ -62,7 +69,7 @@ class FingerLocROS(object):
 
         rospy.loginfo('Switched controller to ' + mode + ' : {}'.format(res.ok) )
 
-        
+
     def control(self, total_time=10, eef_vel=[0, 0, 0]):
         self.switch_controller(mode='velocity')
         ctrl_freq = 128
@@ -91,7 +98,7 @@ class FingerLocROS(object):
         self.pub_joint_vel(q_zero)
         obs = {'finger_pos': finger_pos, 'filter_pos': filter_pos, 'finger_vel': finger_vel}
         return obs
-        
+
     def arm_joint_state_cb(self, joint_msg):
         self.joint_state.q[0] = joint_msg.position[2]
         self.joint_state.q[1] = joint_msg.position[1]
@@ -127,7 +134,7 @@ class FingerLocROS(object):
         for i in range(self.num_joints):
             traj_point.positions.append(q[i])
             traj_point.velocities.append(0.0)
-        
+
         traj.points.append(traj_point)
         traj_goal = FollowJointTrajectoryGoal()
         traj_goal.trajectory = traj
@@ -137,11 +144,11 @@ class FingerLocROS(object):
         # print(traj)
         # self.joint_pos_cmd_pub.publish(traj)
         # rospy.sleep(traj_point.time_from_start)
-        
+
     def get_eef_pose(self):
         eef_pose = kdl.Frame()
         self.pos_fk_solver.JntToCart(self.joint_state.q, eef_pose)
-        
+
         return eef_pose
 
     def _calculate_qdot(self, eef_vel):
@@ -155,9 +162,9 @@ class FingerLocROS(object):
         self.pos_fk_solver.JntToCart(self.joint_state.q, eef_pose)
         eev_vel_base = eef_pose.M * eef_vel_kdl
         self.vel_ik_solver.CartToJnt(self.joint_state.q, eev_vel_base, qdot_sol)
-        
+
         return qdot_sol
-    
+
     def ik(self, eef_pose):
         q_init = self.joint_state.q
         q_sol = kdl.JntArray(self.num_joints)
@@ -188,11 +195,74 @@ class FingerLocROS(object):
 
         q_sol = self.ik(eef_start_pose)
         self.pub_joint_pos(q_sol)
-        
-        
+
+    def get_depth_image(self):
+        '''Pulls one depth image from the camera, and processes (crop, normalize
+        downsample, fill in NaN values). Returns the image as a 64x64 numpy array.'''
+        ima  = rospy.wait_for_message('/camera/depth/image',Image,timeout = 10)
+        cv_image = self.bridge.imgmsg_to_cv2(ima)
+        #DEBUG uncomment to see unprocessed image
+        # print('Press any key to continue...')
+        # cv2.imshow('image',cv_image)
+        # cv2.waitKey(0)
+        # cv2.destroyAllWindows()
+        #convert to array and set NaN to 0
+        im_ar = np.nan_to_num(np.asarray(cv_image))
+
+        #define table dimensions and boundaries
+        width = im_ar.shape[1]
+        height = im_ar.shape[0]
+        top = 28
+        bottom = 28
+        left = 100
+        ave_table = 1.011 #table heigh is 1.011m away from camera
+        desired_table = 1.2
+        desired_floor = 2.2
+
+        #fill in zero values on table with average table height
+        table = im_ar[top:-1-bottom, left:left+height]
+        table[table < 0.7] = ave_table
+        #fill all zero values off the table with the floor height
+        floor_top = im_ar[0:top,:]
+        floor_top[floor_top  < 0.1] = desired_floor
+        floor_bottom = im_ar[-1-bottom:,:]
+        floor_bottom[floor_bottom < 0.1] = desired_floor
+        #shift the table to 1.2m from the camera
+        im_ar += (desired_table - ave_table)
+        #shift any remaining zeros to the table height
+        im_ar[im_ar< (desired_table - ave_table)+0.1] = desired_table
+        #shift everything off the table to the floor height
+        im_ar[0:top,:] = desired_floor
+        im_ar[-1-bottom:,:] = desired_floor
+        #shift everythin off the table above a certain distance to the floor hight
+        # buffer = 0.02
+        # floor_top[floor_top>desired_table+buffer] = desired_floor
+        # floor_bottom[floor_bottom>desired_table+buffer] = desired_floor
+        #shift anything too far the floor height
+        im_ar[im_ar>desired_table+0.1]=desired_floor
+        #normalize & invert image
+        im_ar = 1-(im_ar-np.min(table))/(np.max(im_ar)-np.min(table))
+        #crop
+        im_ar_cropped = im_ar[:,left:left+height]
+        #downsample -- other interpolation options
+        # interpolation = cv2.INTER_NEAREST, cv2.INTER_LANCZOS4
+        im_ar_down = cv2.resize(im_ar_cropped,(64,64), interpolation = cv2.INTER_AREA)
+        #to see realistic view you can upsample it again to get the pixelated
+        #image cv2.resize(cv2.resize(im_ar_cropped,(64,64), interpolation = cv2.INTER_AREA),(480,480),interpolation = cv2.INTER_NEAREST)*255
+        return im_ar_down
+
 def main():
     eef_vel = [0.0, -0.05, 0.0]
     finger_loc = FingerLocROS()
+
+    #test depth image (works)
+    # image = finger_loc.get_depth_image()
+    # im = cv2.resize(image,(480,480),interpolation = cv2.INTER_NEAREST)*255
+    # fig = plt.figure()
+    # ax = fig.add_subplot(1,1,1)
+    # ax.imshow(im, cmap='gray', vmin=0,vmax=255)
+    # plt.show()
+
     finger_loc.go_to_home()
     finger_loc.go_to_start()
     obs = finger_loc.control(total_time=16, eef_vel=eef_vel)
