@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-import math
+import math, sys
 import rospy
 import actionlib
 import PyKDL as kdl
@@ -10,7 +10,13 @@ from trajectory_msgs.msg import JointTrajectoryPoint, JointTrajectory
 from std_msgs.msg import Float64MultiArray, Float64
 from controller_manager_msgs.srv import SwitchController, SwitchControllerRequest, SwitchControllerResponse
 from control_msgs.msg import FollowJointTrajectoryGoal, FollowJointTrajectoryAction
+import image_geometry
+from sensor_msgs.msg import CameraInfo
 
+from network.model import ObservationModel, MotionModel
+from train import params
+from env import utils
+import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -30,7 +36,9 @@ class FingerLocROS(object):
         self.vel_ik_solver = kdl.ChainIkSolverVel_pinv(self.chain)
         self.pos_fk_solver = kdl.ChainFkSolverPos_recursive(self.chain)
         self.pos_ik_solver = kdl.ChainIkSolverPos_LMA(self.chain)
-
+        
+        self.cam_model = image_geometry.PinholeCameraModel()
+        
         self.joint_state = kdl.JntArrayVel(self.num_joints)
         self.joint_names = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
 
@@ -41,9 +49,11 @@ class FingerLocROS(object):
         self.joint_pos_cmd_pub = rospy.Publisher('/scaled_pos_traj_controller/command', JointTrajectory, queue_size=10)
         self.speed_scaling_pub = rospy.Publisher('/speed_scaling_factor', Float64, queue_size=10)
 
-
         self.switch_controller_cli = rospy.ServiceProxy('/controller_manager/switch_controller', SwitchController)
         self.joint_pos_cli = actionlib.SimpleActionClient('/scaled_pos_traj_controller/follow_joint_trajectory', FollowJointTrajectoryAction)
+
+        cam_info  = rospy.wait_for_message('/camera/depth/camera_info', CameraInfo, timeout = 10)
+        self.cam_model.fromCameraInfo(cam_info)
 
         self.bridge = CvBridge() #allows conversion from depth image to array
         rospy.sleep(0.5)
@@ -71,33 +81,42 @@ class FingerLocROS(object):
 
 
     def control(self, total_time=10, eef_vel=[0, 0, 0]):
+        self.switch_controller(mode='position')
+        
+        eef_home_pose = kdl.Frame(kdl.Rotation.Quaternion(0.0, 0.0, 0.0, 1.0), kdl.Vector(0.35, 0.43, 0.3))
+        eef_start_pose = kdl.Frame(kdl.Rotation.Quaternion(0.0, 0.0, 0.0, 1.0), kdl.Vector(0.5, 0.41, 0.2))
+        eef_start_pose2 = kdl.Frame(kdl.Rotation.Quaternion(0.0, 0.0, 0.0, 1.0), kdl.Vector(0.5, 0.41, 0.12))
+        self.go_to_eef_pose(eef_home_pose)
+        rospy.sleep(1)
+        depth_init = self.get_depth_image()
+
+        self.go_to_eef_pose(eef_start_pose)
+        self.go_to_eef_pose(eef_start_pose2)
+
         self.switch_controller(mode='velocity')
-        ctrl_freq = 128
-        num_steps = int(total_time * ctrl_freq)
-        rate = rospy.Rate(ctrl_freq)
+        
+        sample_freq = 16
+        num_steps = 2048
+        rate = rospy.Rate(64)
         finger_pos = np.zeros((num_steps, 2))
-        filter_pos = np.zeros((num_steps, 2))
-        finger_vel = np.zeros((num_steps, 2))
-        alpha = 0.9
-        finger_start_pos = np.array(self.finger_joint_state.position)
-        finger_curr_pos = np.array(self.finger_joint_state.position)
-        finger_vel[0] = np.array(self.finger_joint_state.velocity)
-        # finger_pos[0] = finger_curr_pos - finger_start_pos
-        # filter_pos[0] = finger_curr_pos
-        old_finger_pos = 0.0
-        for t in range(1, num_steps):
+        states = np.zeros((num_steps // sample_freq, 1))
+        finger_start_pos = self.joint_pos
+        
+        sample_n = 0
+        for t in range(num_steps):
+            if rospy.is_shutdown():
+                break
+            
             q_dot = self._calculate_qdot(eef_vel)
             self.pub_joint_vel(q_dot)
-            finger_vel[t] = np.array(self.finger_joint_state.velocity)
-            finger_curr_pos = np.array(self.finger_joint_state.position) - finger_start_pos
-            finger_pos[t] = finger_curr_pos
-            filter_pos[t] = alpha * (filter_pos[t-1] + finger_curr_pos - old_finger_pos)
-            old_finger_pos = finger_curr_pos
             rate.sleep()
-        q_zero = [0.0] * 6
-        self.pub_joint_vel(q_zero)
-        obs = {'finger_pos': finger_pos, 'filter_pos': filter_pos, 'finger_vel': finger_vel}
-        return obs
+            finger_pos[t] = self.joint_pos - finger_start_pos
+
+            # if (t+1) % sample_freq == 0:
+                # sample_n += 1
+        self.pub_joint_vel([0.0] * 6)
+        traj_data = {'finger_pos': finger_pos, 'depth': depth_init, 'states': states}
+        return traj_data
 
     def arm_joint_state_cb(self, joint_msg):
         self.joint_state.q[0] = joint_msg.position[2]
@@ -116,6 +135,7 @@ class FingerLocROS(object):
 
     def finger_joint_state_cb(self, joint_msg):
         self.finger_joint_state = joint_msg
+        self.joint_pos = -np.array(joint_msg.position)
 
     def pub_joint_vel(self, q_dot):
         joint_vel = Float64MultiArray()
@@ -140,10 +160,6 @@ class FingerLocROS(object):
         traj_goal.trajectory = traj
         self.joint_pos_cli.send_goal(traj_goal)
         self.joint_pos_cli.wait_for_result()
-
-        # print(traj)
-        # self.joint_pos_cmd_pub.publish(traj)
-        # rospy.sleep(traj_point.time_from_start)
 
     def get_eef_pose(self):
         eef_pose = kdl.Frame()
@@ -171,35 +187,15 @@ class FingerLocROS(object):
         self.pos_ik_solver.CartToJnt(q_init, eef_pose, q_sol)
         return q_sol
 
-    def go_to_home(self):
+    def go_to_eef_pose(self, eef_pose):
         self.switch_controller(mode='position')
-        eef_home_pos = kdl.Vector(0.5, 0.0, 0.3)
-        eef_home_rot = kdl.Rotation.Quaternion(0.0, 0.0, 0.0, 1.0)
-        eef_home_pose = kdl.Frame(eef_home_rot, eef_home_pos)
-
-        q_sol = self.ik(eef_home_pose)
-        self.pub_joint_pos(q_sol)
-
-    def go_to_start(self):
-        self.switch_controller(mode='position')
-        eef_start_pos = kdl.Vector(0.5, 0.41, 0.2)
-        eef_start_rot = kdl.Rotation.Quaternion(0.0, 0.0, 0.0, 1.0)
-        eef_start_pose = kdl.Frame(eef_start_rot, eef_start_pos)
-
-        q_sol = self.ik(eef_start_pose)
-        self.pub_joint_pos(q_sol)
-
-        eef_start_pos = kdl.Vector(0.5, 0.41, 0.12)
-        eef_start_rot = kdl.Rotation.Quaternion(0.0, 0.0, 0.0, 1.0)
-        eef_start_pose = kdl.Frame(eef_start_rot, eef_start_pos)
-
-        q_sol = self.ik(eef_start_pose)
+        q_sol = self.ik(eef_pose)
         self.pub_joint_pos(q_sol)
 
     def get_depth_image(self):
         '''Pulls one depth image from the camera, and processes (crop, normalize
         downsample, fill in NaN values). Returns the image as a 64x64 numpy array.'''
-        ima  = rospy.wait_for_message('/camera/depth/image',Image,timeout = 10)
+        ima  = rospy.wait_for_message('/camera/depth/image_rect', Image, timeout = 10)
         cv_image = self.bridge.imgmsg_to_cv2(ima)
         #DEBUG uncomment to see unprocessed image
         # print('Press any key to continue...')
@@ -241,44 +237,102 @@ class FingerLocROS(object):
         #shift anything too far the floor height
         im_ar[im_ar>desired_table+0.1]=desired_floor
         #normalize & invert image
-        im_ar = 1-(im_ar-np.min(table))/(np.max(im_ar)-np.min(table))
+        # im_ar = 1-(im_ar-np.min(table))/(np.max(im_ar)-np.min(table))
         #crop
         im_ar_cropped = im_ar[:,left:left+height]
         #downsample -- other interpolation options
         # interpolation = cv2.INTER_NEAREST, cv2.INTER_LANCZOS4
         im_ar_down = cv2.resize(im_ar_cropped,(64,64), interpolation = cv2.INTER_AREA)
-        print(im_ar_down)
+        im_ar_down = 1 - (im_ar_down - np.min(im_ar_down)) / (np.max(im_ar_down) - np.min(im_ar_down))
+        print(im_ar_down.max(), im_ar_down.min())
+        # flip the image
+        im_ar_down = np.flip(im_ar_down, 0).copy()
+        im_ar_down = np.flip(im_ar_down, 1).copy()
+        # print(im_ar_down)
         #to see realistic view you can upsample it again to get the pixelated
-        #image cv2.resize(cv2.resize(im_ar_cropped,(64,64), interpolation = cv2.INTER_AREA),(480,480),interpolation = cv2.INTER_NEAREST)*255
+        # image = cv2.resize(cv2.resize(im_ar_cropped,(64,64), interpolation = cv2.INTER_AREA),(480,480),interpolation = cv2.INTER_NEAREST)*255
+        # self.show_image(im_ar_down)
         return im_ar_down
 
+    def show_image(self, image):
+        fig = plt.figure()
+        ax = fig.add_subplot(1,1,1)
+        ax.imshow(image, cmap='gray')
+        plt.show()
+
+
+def running_mean(x, N):
+    cumsum = np.cumsum(np.insert(x, 0, 0)) 
+    return (cumsum[N:] - cumsum[:-N]) / float(N)
+
+
 def main():
-    eef_vel = [0.0, -0.05, 0.0]
+    eef_vel = [0.0, -0.025, 0.0]
     finger_loc = FingerLocROS()
+    traj_data = finger_loc.control(total_time=16, eef_vel=eef_vel)
 
-    #test depth image (works)
-    image = finger_loc.get_depth_image()
-    im = cv2.resize(image,(480,480),interpolation = cv2.INTER_NEAREST)*255
-    fig = plt.figure()
-    ax = fig.add_subplot(1,1,1)
-    ax.imshow(im, cmap='gray', vmin=0,vmax=255)
+    finger_pos_1 = running_mean(traj_data['finger_pos'][:, 0], 40).reshape(-1, 1)
+    finger_pos_2 = running_mean(traj_data['finger_pos'][:, 1], 40).reshape(-1, 1)
+
+    finger_pos = np.hstack((finger_pos_1, finger_pos_2))
+    
+        _, obs_params = params(model='obs')
+    obs_model = ObservationModel(obs_params).eval()
+    obs_path = '/home/tarik/projects/finger_loc/experiments/weights/real_world_primitive_best.pt'
+    obs_model.load_state_dict(torch.load(obs_path, map_location='cpu'))
+
+    _, motion_params = params(model='motion')
+    motion_model = MotionModel(motion_params).eval()
+    motion_path = '/home/tarik/projects/finger_loc/experiments/weights/motion_best.pt'
+    motion_model.load_state_dict(torch.load(motion_path, map_location='cpu'))
+    
+    belief = torch.ones(64, 64, dtype=torch.float32) / 64**2
+    depth_init = torch.from_numpy(traj_data['depth']).view(1, 1, 64, 64)
+
+    alpha = 0.9
+    sample_n = 0
+    sample_freq = 16
+    filter_high_pos = np.zeros_like(finger_pos, dtype=np.float32)
+    filter_high_pos[0] = finger_pos[0]
+    for t in range(1, finger_pos.shape[0]):
+
+        filter_high_pos[t] = alpha * (filter_high_pos[t-1] + finger_pos[t] - finger_pos[t-1])
+        if (t+1) % sample_freq == 0:
+
+            obs_n = filter_high_pos[sample_n * sample_freq : (sample_n + 1) * sample_freq]
+            obs_n = torch.from_numpy(obs_n).permute(1, 0).unsqueeze(0)
+
+            with torch.no_grad():
+                pred = motion_model(belief.view(1, 1, 64, 64), test=True)
+
+                obs_map = obs_model(depth_init, obs_n, test=True)
+            
+            belief = obs_map * pred
+            belief = belief / belief.sum()
+            
+            pred_state = torch.argmax(belief).numpy()
+            pred_state = np.unravel_index(pred_state, (64, 64))
+            print('Predicted State: {}'.format(pred_state))
+            # print('True State: {}'.format(traj_data['states'][sample_n]))
+            print('Timestep: {}'.format(sample_n))
+            state = np.array([0, 0])
+            image = utils.get_cv_img(depth_init.squeeze().numpy(), belief.numpy(), obs_map.numpy(), state, pred_state, sample_n)
+            cv2.imshow('Bayes-Filtering', image)
+            cv2.waitKey(0)
+            sample_n += 1
+
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+    axes[0].plot(traj_data['finger_pos'][:, 0])
+    axes[0].plot(traj_data['finger_pos'][:, 1])
+
+    axes[1].plot(finger_pos_1)
+    axes[1].plot(finger_pos_2)
+
+    axes[2].plot(filter_high_pos[:, 0], label='finger_1')
+    axes[2].plot(filter_high_pos[:, 1], label='finger_2')
+    plt.legend()
     plt.show()
-
-    # finger_loc.go_to_home()
-    # finger_loc.go_to_start()
-    # obs = finger_loc.control(total_time=16, eef_vel=eef_vel)
-    # finger_loc.go_to_home()
-
-    # fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    # axes[0].plot(obs['finger_pos'][:, 0])
-    # axes[0].plot(obs['finger_pos'][:, 1])
-
-    # axes[1].plot(obs['filter_pos'][:, 0])
-    # axes[1].plot(obs['filter_pos'][:, 1])
-
-    # axes[2].plot(obs['finger_vel'][:, 0])
-    # axes[2].plot(obs['finger_vel'][:, 1])
-    # plt.show()
 
 
 if __name__ == '__main__':
