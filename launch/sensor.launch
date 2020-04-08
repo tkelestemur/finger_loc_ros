@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <launch>
-
-    <node pkg="tf2_ros" type="static_transform_publisher" name="structure_tf" args="0.484, 0.00, 0.925 0.49341236600133137, 0.50650196157267569, 0.5065019615726758, 0.49341236600133137 camera_link world" />
+    
+    <node pkg="tf2_ros" type="static_transform_publisher" name="structure_tf" args="0.484, 0.00, 0.925 -0.49341236600133137, 0.50650196157267569, 0.5065019615726758, 0.49341236600133137 world camera_link" />
     <include file="$(find openni2_launch)/launch/openni2.launch"/>
    
 </launch>
