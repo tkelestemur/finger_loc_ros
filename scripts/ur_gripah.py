@@ -54,7 +54,7 @@ class URGripah(object):
         cam_info = rospy.wait_for_message('/camera/depth/camera_info', CameraInfo, timeout=10)
         self.cam_model.fromCameraInfo(cam_info)
 
-        self.bridge = CvBridge() # allows conversion from depth image to array
+        self.bridge = CvBridge()  # allows conversion from depth image to array
         self.tf_listener = tf.TransformListener()
         self.image_offset = 100
         self.pos_ctrler_running = False
